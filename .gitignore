@@ -172,3 +172,10 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Local ultrasound caches, training artifacts and workstation environment
+/data/
+/data
+/finetune/data/
+/runs/
+/.venv/

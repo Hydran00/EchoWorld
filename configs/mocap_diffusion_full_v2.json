@@ -1,0 +1,8 @@
+{
+  "seed": 42, "world_checkpoint": "runs/mocap_full_v2/best.pt",
+  "diffusion": {"base": 32, "sample_steps": 40, "guidance": 1.5, "noise_seed": 42, "prediction_type": "v"},
+  "batch_size": 128, "workers": 12, "cpu_threads": 8,
+  "lr": 0.0002, "warmup_steps": 250, "steps": 25000,
+  "log_every": 100, "eval_every": 1250, "save_every": 500, "patience": 4,
+  "val_pairs_per_episode": 8, "eval_batch_size": 64
+}

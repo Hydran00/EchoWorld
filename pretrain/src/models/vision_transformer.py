@@ -12,11 +12,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from src.utils.tensors import (
+from ..utils.tensors import (
     trunc_normal_,
     repeat_interleave_batch
 )
-from src.masks.utils import apply_masks
+from ..masks.utils import apply_masks
 
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
@@ -177,9 +177,10 @@ class Attention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]  # [B, num_heads, N, D]
 
         if self.use_sdpa:
-            with torch.backends.cuda.sdp_kernel():
-                x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.proj_drop_prob)
-                attn = None
+            x = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=self.attn_drop.p if self.training else 0.,
+                scale=self.scale)
+            attn = None
         else:
             attn = (q @ k.transpose(-2, -1)) * self.scale  # [B, num_heads, D, D]
             attn = attn.softmax(dim=-1)
@@ -323,6 +324,10 @@ class VisionTransformerPredictor(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x, masks_x, masks, extra=False):
+        # EchoWorld predictor g_phi, with two modes sharing all transformer weights:
+        # - extra=False (spatial): x are the context tokens [B, K, D], masks_x their indices and
+        #   masks the indices of the patches to predict. Output: predicted features of hidden patches.
+        # - extra=True (motion): the third argument is the normalized motion [B, 6]; see forward_extra.
         if extra:
             return self.forward_extra(x, masks_x, masks)
         assert (masks is not None) and (masks_x is not None), 'Cannot run predictor without mask indices'
@@ -340,12 +345,17 @@ class VisionTransformerPredictor(nn.Module):
         x = self.predictor_embed(x)
 
         # -- add positional embedding to x tokens
+        # The predictor re-adds positional information in its own embedding space, using the
+        # context indices masks_x.
         x_pos_embed = self.predictor_pos_embed.repeat(B, 1, 1)
         x += apply_masks(x_pos_embed, masks_x)
 
         _, N_ctxt, D = x.shape
 
         # -- concat mask tokens to x
+        # Query tokens: one shared learned mask token plus the positional embedding of each
+        # hidden patch. Every target block yields a separate sequence; the context is
+        # repeated once per block, giving [len(masks) * B, N_ctxt + M, D].
         pos_embs = self.predictor_pos_embed.repeat(B, 1, 1)
         pos_embs = apply_masks(pos_embs, masks)
         pos_embs = repeat_interleave_batch(pos_embs, B, repeat=len(masks_x))
@@ -362,12 +372,18 @@ class VisionTransformerPredictor(nn.Module):
         x = self.predictor_norm(x)
 
         # -- return preds for mask tokens
+        # Only query outputs are kept and mapped back to the encoder dimension: [len(masks) * B, M, D_enc].
         x = x[:, N_ctxt:]
         x = self.predictor_proj(x)
 
         return x
     
     def forward_extra(self, x, masks_x, action):
+        # EchoWorld motion world modeling. The context tokens of image a are completed by a
+        # single action token, policy_net(action) + mask_token_extra, which carries no
+        # positional embedding. After the transformer, its output is the prediction of the
+        # pooled representation of image b: [B, 1, D_enc]. policy_net and mask_token_extra are
+        # attached externally (pretrain/main.py and mocap/model.py).
         if not isinstance(masks_x, list):
             masks_x = [masks_x]
         # -- Batch Size
@@ -471,19 +487,27 @@ class VisionTransformer(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x, masks=None):
+        # EchoWorld encoder (context encoder f_theta or EMA target encoder f'_theta).
+        # x: [B, 3, H, W]; masks: indices of the patches to keep ([B, K] or a list of such tensors).
+        # Output: [B, K, D] for the kept patches, or [B, N, D] without masks.
         if masks is not None:
             if not isinstance(masks, list):
                 masks = [masks]
 
         # -- patchify x
+        # A 16x16 convolution with stride 16 is a linear projection of each patch: [B, N, D], N = (H/16)(W/16).
         x = self.patch_embed(x)
         B, N, D = x.shape
 
         # -- add positional embedding to x
+        # Fixed (non-learned) 2-D sine-cosine embedding, added *before* masking, so that every
+        # retained token keeps its grid position after the other patches are discarded.
         pos_embed = self.interpolate_pos_encoding(x, self.pos_embed)
         x = x + pos_embed
 
         # -- mask x
+        # Masking is token selection (gather): hidden patches never enter the encoder, which
+        # therefore contains no [MASK] tokens (as in I-JEPA and MAE).
         if masks is not None:
             x = apply_masks(x, masks)
 

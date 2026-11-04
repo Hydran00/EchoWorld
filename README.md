@@ -7,6 +7,10 @@ Authors: Yang Yue\*, Yulin Wang\*, Haojun Jiang, Pan Liu, Shiji Song, Gao Huang\
 
 ## Overview
 
+**IFL mocap dataset integration:** see [README_MOCAP.md](README_MOCAP.md) for
+ultrasound/pose extraction, GPU training, checkpoint/resume, evaluation and image
+generation on the workstation's recordings.
+
 <img src="assets/fig1.png" alt="fig1" style="zoom:50%;" />
 
 **Echocardiography probe guidance** helps sonographers capture standard heart views, but requires significant skill and experience. AI-assisted systems aim to automate this process by interpreting ultrasound images and predicting precise probe movements, making cardiac care more accessible and consistent.

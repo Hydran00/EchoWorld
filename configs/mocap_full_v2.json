@@ -1,0 +1,12 @@
+{
+  "seed": 42,
+  "model": {"image_size": 224, "embed_dim": 384, "encoder_depth": 12, "predictor_depth": 6, "num_heads": 6},
+  "data": {"manifest": "data/ifl_full/manifest.json", "min_dt": 0.4, "max_dt": 3.0, "min_mean": 8.0,
+           "crop_scale": [0.3, 1.0]},
+  "batch_size": 256, "workers": 8, "cpu_threads": 8, "amp": true,
+  "lr": 0.0005, "warmup_steps": 1000, "steps": 10000,
+  "weight_decay": 0.04, "final_weight_decay": 0.4,
+  "selection": "model_recall@5", "patience": 4,
+  "log_every": 50, "eval_every": 500, "save_every": 500,
+  "val_pairs_per_episode": 32, "eval_batch_size": 128
+}

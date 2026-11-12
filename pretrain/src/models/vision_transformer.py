@@ -383,7 +383,7 @@ class VisionTransformerPredictor(nn.Module):
         # single action token, policy_net(action) + mask_token_extra, which carries no
         # positional embedding. After the transformer, its output is the prediction of the
         # pooled representation of image b: [B, 1, D_enc]. policy_net and mask_token_extra are
-        # attached externally (pretrain/main.py and mocap/model.py).
+        # attached externally (pretrain/main.py and mocap/pretraining/model.py).
         if not isinstance(masks_x, list):
             masks_x = [masks_x]
         # -- Batch Size

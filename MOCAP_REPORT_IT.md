@@ -5,7 +5,7 @@ Il task è in pausa su richiesta dell'utente. Il training `stage` è terminato a
 10.000 step; non ci sono training del task attivi. L'estrazione è sospesa con
 SIGSTOP sul gruppo di processi 1886592, inclusi i quattro worker. Questo numero
 identifica solo il processo di questa sessione: prima di un eventuale SIGCONT
-occorre verificare che identifichi ancora il comando `mocap.prepare` atteso.
+occorre verificare che identifichi ancora il comando `mocap.processing.prepare` atteso.
 Sono presenti 93 cache di episodio complete; il dataset originale contiene 168
 episodi. Il manifest completo `data/ifl/manifest.json` non è ancora stato creato.
 
@@ -18,8 +18,8 @@ locale, non il decoder RCDM degli autori.
 
 L'estrazione legge le registrazioni originali in
 `/media/davide.nardi-1/CrucialX9/Nardi/ifl_recording/<nome>/<bag>` in sola lettura.
-Il codice è in [mocap/bags.py](mocap/bags.py),
-[mocap/prepare.py](mocap/prepare.py) e [mocap/geometry.py](mocap/geometry.py).
+Il codice è in [mocap/processing/bags.py](mocap/processing/bags.py),
+[mocap/processing/prepare.py](mocap/processing/prepare.py) e [mocap/processing/geometry.py](mocap/processing/geometry.py).
 
 1. Legge immagini da `/ultrasound_image/ffmpeg`, oppure da
    `/ultrasound/image_raw` se presente. Il video è decodificato sequenzialmente,
@@ -56,7 +56,7 @@ La cache si trova fisicamente in `finetune/data/`. Ho ripristinato il collegamen
 percorso `data/`. Il manifest usato per il resume è identico, anche nella firma
 SHA-256, a quello del checkpoint. Cache e risultati sono esclusi da Git.
 
-Il dataset di training viene costruito da [mocap/dataset.py](mocap/dataset.py).
+Il dataset di training viene costruito da [mocap/processing/dataset.py](mocap/processing/dataset.py).
 Ogni esempio contiene l'ecografia iniziale `I_a`, l'ecografia bersaglio `I_b` e
 il movimento relativo `DeltaT = inverse(T_a) @ T_b`. Il movimento diventa un
 vettore di sei numeri: tre traslazioni in millimetri e un vettore di rotazione
@@ -70,7 +70,7 @@ quasi nere, non un'annotazione di contatto. I gruppi sono separati prima di
 costruire le coppie: `yuan` è validation, `xuesong` è test, gli altri gruppi sono
 training. I nomi delle cartelle non sono identità di paziente verificate.
 
-La struttura del modello è implementata in [mocap/model.py](mocap/model.py).
+La struttura del modello è implementata in [mocap/pretraining/model.py](mocap/pretraining/model.py).
 
 | Componente | Input | Output e ruolo |
 |---|---|---|
@@ -99,7 +99,7 @@ a ricostruire anche dal latente target. Le ultime estensioni e varie scelte di
 architettura/training sono adattamenti locali, non una riproduzione integrale
 del protocollo del paper.
 
-Il secondo training, opzionale, usa [mocap/diffusion.py](mocap/diffusion.py).
+Il secondo training, opzionale, usa [mocap/decoder/diffusion.py](mocap/decoder/diffusion.py).
 Congela il world model addestrato e aggiorna una U-Net condizionata sul suo
 latente predetto. Durante il training aggiunge rumore all'ecografia bersaglio e
 impara a rimuoverlo; l'esperimento completato più riuscito usa la parametrizzazione

@@ -5,14 +5,14 @@ import numpy as np
 import pytest
 import torch
 from scipy.spatial.transform import Rotation
-from mocap.bags import decode_image, static_chain
-from mocap.dataset import MocapPairs
-from mocap.geometry import matrix, relative_action, PoseSeries
-from mocap.model import MotionWorldModel
-from mocap.prepare import split_episodes, preprocess
-from mocap.train import StepBatches, save_checkpoint
-from mocap.evaluate import load_model, image_metrics
-from mocap.generate import validate_trajectory
+from mocap.processing.bags import decode_image, static_chain
+from mocap.processing.dataset import MocapPairs
+from mocap.processing.geometry import matrix, relative_action, PoseSeries
+from mocap.pretraining.model import MotionWorldModel
+from mocap.processing.prepare import split_episodes, preprocess
+from mocap.pretraining.train import StepBatches, save_checkpoint
+from mocap.evaluation.evaluate import load_model, image_metrics
+from mocap.decoder.generate import validate_trajectory
 
 torch.set_num_threads(2)
 
@@ -137,7 +137,7 @@ def test_pair_crop_is_shared_reproducible_and_train_only(tmp_path):
 
 
 def test_weight_decay_schedule_and_selection():
-    from mocap.train import wd_at, selection_score
+    from mocap.pretraining.train import wd_at, selection_score
     config = dict(steps=100, weight_decay=.04, final_weight_decay=.4)
     assert wd_at(0, config) == pytest.approx(.04) and wd_at(100, config) == pytest.approx(.4)
     assert wd_at(50, config) == pytest.approx(.22)
@@ -145,6 +145,27 @@ def test_weight_decay_schedule_and_selection():
     metrics = dict(val_loss=.5, **{'model_recall@5': .3})
     assert selection_score(metrics, {}) == -.5
     assert selection_score(metrics, dict(selection='model_recall@5')) == .3
+
+
+def test_independent_crops_remove_pair_augmentation_cue_and_preserve_actions(tmp_path):
+    path = make_cache(tmp_path, size=64)
+    pixels = np.arange(64 * 64, dtype=np.uint32).reshape(64, 64).astype(np.uint8)
+    for folder in ['a', 'b']:
+        np.save(tmp_path / folder / 'images.npy', np.repeat(pixels[None], 12, axis=0))
+    kwargs = dict(image_size=64, min_dt=.2, max_dt=.8, min_mean=0, crop_scale=(.3, .5))
+    shared = MocapPairs(path, **kwargs)
+    independent = MocapPairs(path, crop_mode='independent', **kwargs)
+    a, b = shared[(0, 7)], independent[(0, 7)]
+    torch.testing.assert_close(a['source'], a['target'])
+    torch.testing.assert_close(a['source'], b['source'])
+    assert not torch.allclose(b['source'], b['target'])
+    torch.testing.assert_close(b['target'], independent[(0, 7)]['target'])
+    torch.testing.assert_close(a['action'], b['action'])
+    assert (a['source_index'], a['target_index']) == (b['source_index'], b['target_index'])
+    val = MocapPairs(path, split='val', crop_mode='independent', **kwargs)
+    torch.testing.assert_close(val[0]['source'], torch.from_numpy(pixels.copy()).float()[None] / 255.)
+    with pytest.raises(ValueError, match='crop_mode'):
+        MocapPairs(path, crop_mode='typo', **kwargs)
 
 
 def test_resumed_batch_sampling_is_identical():
@@ -157,14 +178,14 @@ SMALL_WORLD = dict(image_size=128, embed_dim=24, encoder_depth=1, predictor_dept
 
 
 def test_info_nce_pairs_prediction_with_its_own_target():
-    from mocap.model import info_nce
+    from mocap.pretraining.model import info_nce
     a = torch.eye(4)
     assert info_nce(torch.cat([a, a]), temperature=.01) < 1e-3
     assert info_nce(torch.cat([a, a.roll(1, 0)]), temperature=.01) > 10
 
 
 def test_model_motion_gradients_and_checkpoint(tmp_path):
-    from mocap.evaluate import evaluate_world
+    from mocap.evaluation.evaluate import evaluate_world
     config = dict(model=SMALL_WORLD)
     model = MotionWorldModel(**config['model'])
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=.001)
@@ -207,7 +228,7 @@ def test_evaluation_metrics_identity():
 
 def test_evaluation_exports_traceable_pair_metrics(tmp_path):
     import csv
-    from mocap.evaluate import evaluate
+    from mocap.evaluation.evaluate import evaluate
 
     class ActionOffset(torch.nn.Module):
         def predict(self, source, action, shared_noise=False):
@@ -232,12 +253,25 @@ def test_evaluation_exports_traceable_pair_metrics(tmp_path):
     grids = sorted(output.glob('comparison*.png'))
     assert [p.name for p in grids] == ['comparison1.png'] and len(result['displayed_pairs']) == len(dataset)
     assert result['videos'] and all((output / v['file']).stat().st_size > 0 for v in result['videos'])
+    assert (output / 'videos_all.mp4').stat().st_size > 0
+    # Backward motion: same pairs, source/target swapped and the inverse action.
+    backward = evaluate(ActionOffset(), dataset, torch.device('cpu'), None, batch_size=3, reverse=True)
+    expected = np.mean([abs(float(dataset[i]['reverse_action'][0])) / 20. for i in range(len(dataset))])
+    assert backward['reverse'] and backward['pairs'] == len(dataset)
+    assert backward['model_mae'] == pytest.approx(expected, abs=1e-6)
+    from mocap.evaluation.evaluate import save_all_videos
+    # The middle source (frame 6) starts the second tracking segment: join the segments so that
+    # recorded frames exist before it.
+    dataset.episodes[0]['segments'] = np.zeros_like(dataset.episodes[0]['segments'])
+    videos = save_all_videos(ActionOffset(), dataset, torch.device('cpu'), output, count=1, reverse=True)
+    assert videos['videos_reverse'] and (output / 'videos_all_reverse.mp4').stat().st_size > 0
+    assert all(v['target_indices'][0] < v['source_index'] for v in videos['videos_reverse'])
 
 
 def test_ffmpeg_decoder_timestamp_mapping_and_flush():
     import av
     from fractions import Fraction
-    from mocap.bags import ultrasound_frames, US_FFMPEG
+    from mocap.processing.bags import ultrasound_frames, US_FFMPEG
     encoder = av.CodecContext.create('libx264', 'w')
     encoder.width = encoder.height = 32
     encoder.pix_fmt = 'yuv420p'
@@ -270,14 +304,14 @@ def test_cli_training_resume_matches_uninterrupted(tmp_path):
     import sys
     path = make_cache(tmp_path, size=128)
     config = dict(seed=42, model=SMALL_WORLD,
-                  data=dict(manifest=str(path), min_dt=.2, max_dt=.8, min_mean=8., crop_scale=[.3, 1.]),
+                  data=dict(manifest=str(path), min_dt=.2, max_dt=.8, min_mean=8., crop_scale=[.3, 1.], split_mode='leave-out'),
                   batch_size=2, workers=0, cpu_threads=2, amp=False, lr=.0003,
                   warmup_steps=1, steps=4, log_every=1, eval_every=2, save_every=1,
                   weight_decay=.04, final_weight_decay=.4, selection='model_recall@5', patience=1,
                   val_pairs_per_episode=2, eval_batch_size=2)
     config_path = tmp_path / 'config.json'
     config_path.write_text(json.dumps(config))
-    base = [sys.executable, '-m', 'mocap.train', '--config', str(config_path), '--device', 'cpu']
+    base = [sys.executable, '-m', 'mocap.pretraining.train', '--config', str(config_path), '--device', 'cpu']
     split, full = tmp_path / 'split', tmp_path / 'full'
     for args in [base + ['--output', str(split), '--max-steps', '2'],
                  base + ['--output', str(split), '--resume', str(split / 'last.pt')],
@@ -295,7 +329,7 @@ def test_cli_training_resume_matches_uninterrupted(tmp_path):
 
 @pytest.mark.parametrize('prediction_type', ['epsilon', 'v'])
 def test_diffusion_freezes_world_and_matches_ablation_noise(tmp_path, prediction_type):
-    from mocap.diffusion import DiffusionUltrasound
+    from mocap.decoder.diffusion import DiffusionUltrasound
     world = SMALL_WORLD
     diffusion = dict(base=8, sample_steps=3, guidance=1.5, noise_seed=42, prediction_type=prediction_type)
     model = DiffusionUltrasound(world, **diffusion)
@@ -319,7 +353,7 @@ def test_diffusion_freezes_world_and_matches_ablation_noise(tmp_path, prediction
 def test_diffusion_cli_resume_accepts_added_patience(tmp_path):
     import subprocess
     import sys
-    from mocap.train import same_run
+    from mocap.pretraining.train import same_run
     assert same_run(dict(lr=1, patience=2), dict(lr=1)) and not same_run(dict(lr=1), dict(lr=2))
     path = make_cache(tmp_path, size=128)
     world = MotionWorldModel(**SMALL_WORLD)
@@ -332,7 +366,7 @@ def test_diffusion_cli_resume_accepts_added_patience(tmp_path):
                   batch_size=2, workers=0, cpu_threads=2, lr=.0002, warmup_steps=1, steps=3,
                   log_every=1, eval_every=1, save_every=1, val_pairs_per_episode=2)
     config_path = tmp_path / 'diffusion.json'
-    base = [sys.executable, '-m', 'mocap.diffusion', '--config', str(config_path), '--device', 'cpu',
+    base = [sys.executable, '-m', 'mocap.decoder.diffusion', '--config', str(config_path), '--device', 'cpu',
             '--output', str(tmp_path / 'run')]
     for extra, patience in [(['--max-steps', '1'], None), (['--resume', str(tmp_path / 'run' / 'last.pt')], 100)]:
         config_path.write_text(json.dumps(dict(config, **({'patience': patience} if patience else {}))))
@@ -344,7 +378,7 @@ def test_diffusion_cli_resume_accepts_added_patience(tmp_path):
 
 def test_diffusers_denoiser_uses_condition_and_matches_cosine_schedule():
     import math
-    from mocap.diffusion import DiffusionUltrasound
+    from mocap.decoder.diffusion import DiffusionUltrasound
     model = DiffusionUltrasound(SMALL_WORLD, base=8, sample_steps=3, prediction_type='v')
     x, t = torch.randn(2, 1, 128, 128), torch.tensor([10, 500])
     latent = torch.randn(2, SMALL_WORLD['embed_dim'])
@@ -355,3 +389,45 @@ def test_diffusers_denoiser_uses_condition_and_matches_cosine_schedule():
     cumulative = torch.cos((s + .008) / 1.008 * math.pi / 2).square()
     beta = (1 - cumulative[1:] / cumulative[:-1]).clamp(max=.999)
     torch.testing.assert_close(model.scheduler.alphas_cumprod.double(), (1 - beta).cumprod(0), rtol=1e-4, atol=1e-6)
+
+
+def test_random_split_is_episode_level_seeded_and_ignores_subjects():
+    from mocap.processing.dataset import assign_splits
+    episodes = [dict(episode_id=f'{g}/bag{i}', group=g, split='train' if g != 'z' else 'val')
+                for g in 'xyz' for i in range(20)]
+    manifest = dict(episodes=episodes)
+    splits = assign_splits(manifest, 'random', (.7, .15, .15), 7)
+    assert splits == assign_splits(manifest, 'random', (.7, .15, .15), 7)
+    assert splits != assign_splits(manifest, 'random', (.7, .15, .15), 8)
+    counts = {s: sum(v == s for v in splits.values()) for s in ('train', 'val', 'test')}
+    assert counts == dict(train=42, val=9, test=9)
+    # Subjects are shared across splits, and the manifest split is ignored.
+    assert len({e['group'] for e in episodes if splits[e['episode_id']] == 'val'}) > 1
+    assert assign_splits(manifest, 'leave-out') == {e['episode_id']: e['split'] for e in episodes}
+    with pytest.raises(ValueError, match='split_fractions'):
+        assign_splits(manifest, 'random', (.7, .2, .2))
+    with pytest.raises(ValueError, match='split_mode'):
+        assign_splits(manifest, 'subject')
+
+
+def test_random_split_dataset_and_legacy_resume(tmp_path):
+    from mocap.pretraining.train import check_split, same_run
+    path = make_cache(tmp_path)
+    metadata = json.loads(path.read_text())
+    metadata['episodes'][1]['group'] = 'a'  # leakage is allowed by the random split
+    path.write_text(json.dumps(metadata))
+    kwargs = dict(image_size=32, split_mode='random', split_fractions=(.5, .5, 0.))
+    train, val = MocapPairs(path, **kwargs), MocapPairs(path, split='val', **kwargs)
+    assert {e['episode_id'] for e in train.episodes}.isdisjoint(e['episode_id'] for e in val.episodes)
+    assert len(train.episodes) == len(val.episodes) == 1 and val.episodes[0]['split'] == 'val'
+    with pytest.raises(ValueError, match='leakage'):
+        MocapPairs(path, image_size=32)
+    data = dict(manifest=str(path), split_mode='random')
+    check_split(data, path)
+    with pytest.raises(ValueError, match='validation_manifest'):
+        check_split(data, tmp_path / 'other.json')
+    # Checkpoints saved before split_mode existed were trained with the leave-out split.
+    assert same_run(dict(data=dict(min_dt=.1)), dict(data=dict(min_dt=.1, split_mode='leave-out')))
+    assert not same_run(dict(data=dict(min_dt=.1)), dict(data=dict(min_dt=.1, split_mode='random')))
+    assert same_run(dict(data=dict(manifest='old/manifest.json'), validation_manifest='old/manifest.json'),
+                    dict(data=dict(manifest='new/manifest.json'), validation_manifest='new/manifest.json'))

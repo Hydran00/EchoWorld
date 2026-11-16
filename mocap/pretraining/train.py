@@ -144,8 +144,12 @@ def main():
     # As in the released helper.init_opt, biases and 1-D parameters (norms, tokens) are not decayed.
     trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW([
-        dict(params=[p for n, p in trainable if 'bias' not in n and p.ndim != 1], weight_decay=wd_at(0, config)),
-        dict(params=[p for n, p in trainable if 'bias' in n or p.ndim == 1], weight_decay=0., wd_exclude=True),
+        # Anatomical vertex embeddings (anatomy models) are not decayed either: most vertices are
+        # rarely visited and would otherwise shrink to zero between visits.
+        dict(params=[p for n, p in trainable if 'bias' not in n and p.ndim != 1 and n != 'anatomy.vertex_embeddings'],
+             weight_decay=wd_at(0, config)),
+        dict(params=[p for n, p in trainable if 'bias' in n or p.ndim == 1 or n == 'anatomy.vertex_embeddings'],
+             weight_decay=0., wd_exclude=True),
     ], lr=config['lr'])
     step, best, stale = 0, -float('inf'), 0
     if args.init_from:
@@ -208,7 +212,8 @@ def main():
                                                for k in ['source', 'target', 'action', 'reverse_action'])
             # bfloat16 autocast for the transformer computation; losses are evaluated in float32.
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
-                loss, values = model(source, target, action, reverse)
+                loss, values = model(source, target, action, reverse,
+                                     model.batch_attachment(batch, 'source', device), model.batch_attachment(batch, 'target', device))
             if not torch.isfinite(loss):
                 raise FloatingPointError(f'Non-finite loss at step {step}')
             loss.backward()

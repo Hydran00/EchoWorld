@@ -1,8 +1,8 @@
 """Append a results section to RESULTS.md from world-model and decoder metrics.json files.
 
     python -m mocap.evaluation.results_md --title "Canonical-frame poses" --note "..." \
-        --world "Random (`mocap_canonical_random`)=runs/mocap_canonical_random/eval_val_20pairs/metrics.json" \
-        --decoder "Random (`diffusion_canonical_random`)=runs/diffusion_canonical_random/eval_best/metrics.json" \
+        --world "Random (`mocap_canonical_random`)=runs/mocap_canonical_random/mocap_canonical_random/eval_val_20pairs/metrics.json" \
+        --decoder "Random (`diffusion_canonical_random`)=runs/mocap_canonical_random/diffusion_canonical_random/eval_best/metrics.json" \
         --append RESULTS.md
 
 World-model files come from `mocap.evaluation.evaluate` on a world checkpoint (recall, losses);

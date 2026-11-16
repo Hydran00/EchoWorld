@@ -71,9 +71,10 @@ class DiffusionUltrasound(nn.Module):
         self.ema_denoiser.eval()
         return self
 
-    def loss(self, source, target, action):
+    def loss(self, source, target, action, anatomy=None):
+        # anatomy: attachment of the source frame, only for world models conditioned on anatomy.
         with torch.no_grad():
-            latent = self.world.predict_latent(source, action)
+            latent = self.world.predict_latent(source, action, anatomy)
             # Classifier-free guidance: the condition is dropped (zeroed) for 10% of the samples.
             latent = latent * (torch.rand(len(source), 1, device=source.device) > .1)
         clean = 2 * target - 1                                   # images rescaled to [-1, 1]
@@ -89,13 +90,13 @@ class DiffusionUltrasound(nn.Module):
             q.lerp_(p, 1 - decay)
 
     @torch.no_grad()
-    def predict(self, source, action, shared_noise=False):
+    def predict(self, source, action, shared_noise=False, anatomy=None):
         # Deterministic generation: seeded initial noise, DDIM (eta = 0) with the EMA denoiser and
         # classifier-free guidance, output = uncond + w (cond - uncond). Motion and zero-motion
         # predictions share the same noise, so their difference is due to the conditioning only.
         # shared_noise=True uses one noise image for the whole batch (videos along a trajectory),
         # so that consecutive frames differ only through their conditioning.
-        latent = self.world.predict_latent(source, action)
+        latent = self.world.predict_latent(source, action, anatomy)
         generator = torch.Generator(device=source.device).manual_seed(self.noise_seed)
         shape = (1 if shared_noise else len(source), 1, self.image_size, self.image_size)
         x = torch.randn(shape, device=source.device, generator=generator).expand(len(source), -1, -1, -1).contiguous()
@@ -117,12 +118,18 @@ def main():
     from mocap.evaluation.evaluate import evaluate
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--config', required=True)
-    p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--output', type=Path,
+                   help='Default: next to the world model, runs/<exp>/diffusion_<exp without "mocap_"> for a world '
+                        'checkpoint runs/<exp>/<exp>/best.pt (one folder per experiment)')
     p.add_argument('--resume', type=Path)
     p.add_argument('--max-steps', type=int)
     p.add_argument('--device', default='cuda:0')
     args = p.parse_args()
     config = json.loads(Path(args.config).read_text())
+    if args.output is None:
+        world_run = Path(config['world_checkpoint']).parent
+        args.output = world_run.parent / ('diffusion_' + world_run.name.removeprefix('mocap_'))
+        print(f'Decoder output: {args.output}', flush=True)
     device = torch.device(args.device)
     torch.set_num_threads(config.get('cpu_threads', 4))
     torch.manual_seed(config['seed'])
@@ -212,7 +219,7 @@ def main():
                 group['lr'] = lr_at(step, config)
             source, target, action = (batch[k].to(device) for k in ['source', 'target', 'action'])
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == 'cuda'):
-                loss = model.loss(source, target, action)
+                loss = model.loss(source, target, action, model.world.batch_attachment(batch, 'source', device))
             if not torch.isfinite(loss):
                 raise FloatingPointError('Non-finite diffusion loss')
             loss.backward()

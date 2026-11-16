@@ -323,13 +323,13 @@ class VisionTransformerPredictor(nn.Module):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, x, masks_x, masks, extra=False):
+    def forward(self, x, masks_x, masks, extra=False, condition=None, modulation=None):
         # EchoWorld predictor g_phi, with two modes sharing all transformer weights:
         # - extra=False (spatial): x are the context tokens [B, K, D], masks_x their indices and
         #   masks the indices of the patches to predict. Output: predicted features of hidden patches.
         # - extra=True (motion): the third argument is the normalized motion [B, 6]; see forward_extra.
         if extra:
-            return self.forward_extra(x, masks_x, masks)
+            return self.forward_extra(x, masks_x, masks, condition, modulation)
         assert (masks is not None) and (masks_x is not None), 'Cannot run predictor without mask indices'
 
         if not isinstance(masks_x, list):
@@ -378,12 +378,15 @@ class VisionTransformerPredictor(nn.Module):
 
         return x
     
-    def forward_extra(self, x, masks_x, action):
+    def forward_extra(self, x, masks_x, action, condition=None, modulation=None):
         # EchoWorld motion world modeling. The context tokens of image a are completed by a
         # single action token, policy_net(action) + mask_token_extra, which carries no
         # positional embedding. After the transformer, its output is the prediction of the
         # pooled representation of image b: [B, 1, D_enc]. policy_net and mask_token_extra are
         # attached externally (pretrain/main.py and mocap/pretraining/model.py).
+        # condition: optional extra tokens [B, C, D_pred] (e.g. the anatomical embedding of the
+        # current probe position), inserted between the context and the action token; only the
+        # action token is returned. condition=None is the original computation.
         if not isinstance(masks_x, list):
             masks_x = [masks_x]
         # -- Batch Size
@@ -402,15 +405,26 @@ class VisionTransformerPredictor(nn.Module):
         action_emb = self.policy_net(action).unsqueeze(1)
         action_tokens = action_emb + self.mask_token_extra.repeat(B, 1, 1)
         
+        if condition is not None:
+            x = torch.cat([x, condition.to(x.dtype)], dim=1)
         x = torch.cat([x, action_tokens], dim=1)
 
         # -- fwd prop
-        for blk in self.predictor_blocks:
-            x = blk(x)
+        # modulation: optional per-block (shift1, scale1, shift2, scale2), each [B, 1, D] (adaLN
+        # conditioning, e.g. on the anatomical position): LN(x) * (1 + scale) + shift before attention
+        # and MLP. Zero modulation is the original computation.
+        for i, blk in enumerate(self.predictor_blocks):
+            if modulation is None:
+                x = blk(x)
+            else:
+                shift1, scale1, shift2, scale2 = modulation[i]
+                y, _ = blk.attn(blk.norm1(x) * (1 + scale1) + shift1)
+                x = x + blk.drop_path(y)
+                x = x + blk.drop_path(blk.mlp(blk.norm2(x) * (1 + scale2) + shift2))
         x = self.predictor_norm(x)
 
         # -- return preds for mask tokens
-        x = x[:, N_ctxt:]
+        x = x[:, -1:] if condition is not None else x[:, N_ctxt:]
         x = self.predictor_proj(x)
         return x
 

@@ -20,6 +20,15 @@ episodes keep the split of every previous run.
         --reconstructions ../Canonical_US/outputs/probe_reconstruction_trims --output data/ifl_canonical
     python -m mocap.processing.canonical loso --manifest data/ifl_canonical/manifest.json --val fengxhou --test xuesong \
         --output data/loso_canonical/fengxhou
+
+Anatomical attachment (optional input of the world model, model.anatomy): for every frame, the triangle
+of the canonical body closest to the canonical probe position and its barycentric coordinates,
+stored in poses.npz as canonical_face [N] (int64) and canonical_barycentric [N, 3]. The body mesh is
+copied to <cache>/canonical_body.ply. `build --body` adds them; an existing cache is updated in place
+(images untouched) with
+
+    python -m mocap.processing.canonical anatomy --manifest data/ifl_canonical/manifest.json \
+        --body ../Canonical_US/outputs/probe_reconstruction_trims/shard0/canonical_smpl.ply
 """
 import argparse
 import hashlib
@@ -77,7 +86,57 @@ def canonical_poses(times, samples, max_gap_ns):
     return poses, valid, bracket
 
 
-def build(source, reconstructions, output, max_gap_ms=100., overwrite=False, min_frames=10):
+class SurfaceAttachment:
+    """Closest point of a triangle mesh: triangle index and barycentric coordinates (sum 1)."""
+    def __init__(self, mesh_path):
+        import open3d as o3d
+        mesh = o3d.io.read_triangle_mesh(str(mesh_path))
+        self.vertices, self.faces = np.asarray(mesh.vertices), np.asarray(mesh.triangles)
+        if not len(self.faces):
+            raise ValueError(f'No triangles in {mesh_path}')
+        self.scene = o3d.t.geometry.RaycastingScene()
+        self.scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+        self.o3d = o3d
+
+    def __call__(self, points):
+        hits = self.scene.compute_closest_points(self.o3d.core.Tensor(np.asarray(points, np.float32)))
+        uv = hits['primitive_uvs'].numpy().astype(np.float64)
+        # Open3D convention (as Canonical_US): point = (1 - u - v) v0 + u v1 + v v2.
+        barycentric = np.clip(np.column_stack((1 - uv.sum(1), uv)), 0, 1)
+        barycentric /= barycentric.sum(1, keepdims=True)
+        return hits['primitive_ids'].numpy().astype(np.int64), barycentric.astype(np.float32)
+
+
+def add_anatomy(manifest_path, body):
+    """Add canonical_face / canonical_barycentric to every poses.npz of a canonical cache (in place)."""
+    manifest_path = Path(manifest_path).resolve()
+    manifest = json.loads(manifest_path.read_text())
+    attach = SurfaceAttachment(body)
+    target = manifest_path.parent / 'canonical_body.ply'
+    if Path(body).resolve() != target:
+        shutil.copyfile(body, target)
+    distances = []
+    for entry in manifest['episodes']:
+        path = manifest_path.parent / entry['path'] / 'poses.npz'
+        poses = dict(np.load(path))
+        xyz = poses['world_T_probe'][:, :3, 3]
+        face, bary = attach(xyz)
+        surface = np.einsum('ni,nij->nj', bary, attach.vertices[attach.faces[face]])
+        distances.append(np.linalg.norm(surface - xyz, axis=1) * 1000)
+        poses.update(canonical_face=face, canonical_barycentric=bary)
+        temp = path.with_name('poses.tmp.npz')
+        np.savez(temp, **poses)
+        temp.replace(path)
+    d = np.concatenate(distances)
+    manifest.setdefault('canonical', {})['anatomy'] = dict(
+        body='canonical_body.ply', vertices=int(len(attach.vertices)), faces=int(len(attach.faces)),
+        source_body=str(Path(body).resolve()), distance_to_surface_mm=dict(median=float(np.median(d)), max=float(d.max())))
+    manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
+    print(f'anatomy for {len(manifest["episodes"])} episodes ({len(attach.vertices)} vertices, {len(attach.faces)} faces); '
+          f'distance probe->surface median {np.median(d):.2f} mm, max {d.max():.2f} mm')
+
+
+def build(source, reconstructions, output, max_gap_ms=100., overwrite=False, min_frames=10, body=None):
     source = Path(source).resolve()
     manifest = json.loads(source.read_text())
     output = Path(output).resolve()
@@ -108,10 +167,15 @@ def build(source, reconstructions, output, max_gap_ms=100., overwrite=False, min
         if len(keep) < min_frames:
             skipped[entry['episode_id']] = f'{len(keep)} frames with a canonical pose'
             continue
-        # New segments: original tracking segment changes, or kept frames not bridged by consecutive samples.
+        # New segments: original tracking segment changes, or a real gap in the canonical samples between
+        # two kept frames (two consecutive samples more than max_gap apart, e.g. projection misses).
+        # Images and poses have similar, unsynchronized rates, so the bracketing sample index of
+        # consecutive frames often advances by 2 without any gap: that alone must not break a segment.
         seg = poses['segment_ids'][keep]
         br = bracket[keep]
-        breaks = np.concatenate([[False], (seg[1:] != seg[:-1]) | (br[1:] - br[:-1] > 1)])
+        st = np.sort(samples['timestamps_ns'])
+        gap_before = np.concatenate([[0], np.cumsum(np.diff(st) > max_gap)])   # gaps among samples [0, j]
+        breaks = np.concatenate([[False], (seg[1:] != seg[:-1]) | (gap_before[br[1:]] - gap_before[br[:-1]] > 0)])
         segments = np.cumsum(breaks)
         out = {k: v[keep] if v.ndim and len(v) == len(images) else v for k, v in poses.items()}
         out['tracker_T_probe'] = out['world_T_probe']          # original tracker pose, for reference
@@ -141,6 +205,9 @@ def build(source, reconstructions, output, max_gap_ms=100., overwrite=False, min
           f'frames with a canonical pose -> {output / "manifest.json"}')
     for episode_id, reason in skipped.items():
         print(f'  skipped {episode_id}: {reason}')
+    if body:
+        add_anatomy(output / 'manifest.json', body)
+        result = json.loads((output / 'manifest.json').read_text())
     return result
 
 
@@ -170,6 +237,10 @@ def main():
     b.add_argument('--output', default=str(ROOT / 'data' / 'ifl_canonical'))
     b.add_argument('--max-gap-ms', type=float, default=100.)
     b.add_argument('--overwrite', action='store_true')
+    b.add_argument('--body', help='canonical body mesh: also store the anatomical attachment (see anatomy)')
+    a = sub.add_parser('anatomy')
+    a.add_argument('--manifest', default=str(ROOT / 'data' / 'ifl_canonical' / 'manifest.json'))
+    a.add_argument('--body', required=True, help='canonical body mesh (Canonical_US canonical_smpl.ply)')
     f = sub.add_parser('loso')
     f.add_argument('--manifest', default=str(ROOT / 'data' / 'ifl_canonical' / 'manifest.json'))
     f.add_argument('--val', required=True)
@@ -179,7 +250,9 @@ def main():
     if args.command == 'loso':
         loso(args.manifest, args.val, args.test, args.output)
     elif args.command == 'build':
-        build(args.source, args.reconstructions, args.output, args.max_gap_ms, args.overwrite)
+        build(args.source, args.reconstructions, args.output, args.max_gap_ms, args.overwrite, body=args.body)
+    elif args.command == 'anatomy':
+        add_anatomy(args.manifest, args.body)
     else:
         p.print_help()
 

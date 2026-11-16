@@ -72,6 +72,18 @@ def displayed_indices(dataset, count):
 VIDEO_SECONDS = 3.   # minimum time covered by the validation videos
 
 
+def attachment_of(dataset, episode, index, device):
+    """(face [1], barycentric [1, 3]) of one frame for anatomy datasets, else None."""
+    if not getattr(dataset, 'anatomy', False):
+        return None
+    face, barycentric = dataset.attachment(episode, index)
+    return face[None].to(device), barycentric[None].to(device)
+
+
+def expand_attachment(attachment, n):
+    return None if attachment is None else tuple(x.expand(n, *x.shape[1:]) for x in attachment)
+
+
 def rollout_dt(dataset):
     # Default fixed rollout Δt: the shortest training interval (configs override it with rollout_dt).
     return dataset.min_dt
@@ -114,11 +126,13 @@ def save_videos(model, dataset, device, output, count=10, step=.1, fps=5, batch_
             continue
         context = dataset.image(ei, source)[None].to(device)
         actions = torch.from_numpy(relative_action(poses[source], poses[np.array(frames)])).to(device)
+        here = attachment_of(dataset, ei, source, device)
         predictions = []
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp and device.type == 'cuda'):
-            zero = model.predict(context, torch.zeros_like(actions[:1]), shared_noise=True)[0].float().cpu()
+            zero = model.predict(context, torch.zeros_like(actions[:1]), shared_noise=True, anatomy=here)[0].float().cpu()
             for chunk in actions.split(batch_size):
-                predictions.append(model.predict(context.expand(len(chunk), -1, -1, -1), chunk, shared_noise=True).float().cpu())
+                predictions.append(model.predict(context.expand(len(chunk), -1, -1, -1), chunk, shared_noise=True,
+                                                 anatomy=expand_attachment(here, len(chunk))).float().cpu())
         predictions = torch.cat(predictions)
         video = []
         for j, prediction in zip(frames, predictions):
@@ -181,7 +195,8 @@ def save_rollout_videos(model, dataset, device, output, count=10, step=None, hor
         for a, b in zip(frames[:-1], frames[1:]):
             action = torch.from_numpy(relative_action(poses[a], poses[b])[None]).to(device)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp and device.type == 'cuda'):
-                prediction = model.predict(current, action).float()
+                # The current position is the measured pose of the recorded frame a (known at inference).
+                prediction = model.predict(current, action, anatomy=attachment_of(dataset, ei, a, device)).float()
             predictions.append((current[0].cpu(), prediction[0].cpu()))
             dts.append(abs(float(times[b] - times[a])) / 1e9)
             current = (prediction.clamp(0, 1) * 255).round() / 255
@@ -250,9 +265,10 @@ def evaluate(model, dataset, device, output=None, batch_size=16, max_batches=0, 
         if reverse:
             # Backward motion on the same pairs: predict I_a from I_b with the inverse motion b -> a.
             source, target, action = target, source, batch['reverse_action'].to(device)
+        here = MotionWorldModel.batch_attachment(batch, 'target' if reverse else 'source', device)
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp and device.type == 'cuda'):
-            prediction = model.predict(source, action)
-            zero = model.predict(source, torch.zeros_like(action))
+            prediction = model.predict(source, action, anatomy=here)
+            zero = model.predict(source, torch.zeros_like(action), anatomy=here)
         batch_metrics = {}
         for name, value in [('model', prediction), ('copy_context', source), ('zero_motion', zero)]:
             for metric, values in image_metrics(value, target).items():
@@ -342,10 +358,13 @@ def evaluate_world(model, dataset, device, output=None, batch_size=32, amp=True)
         torch.manual_seed(0)  # identical masks at every validation, so losses are comparable across steps
         for batch in loader:
             source, target, action, reverse = (batch[k].to(device) for k in ['source', 'target', 'action', 'reverse_action'])
+            # Anatomy models: attachment of the context frame only (the target's is used solely by
+            # the reverse direction of the training loss, where b is the context).
+            here, there = model.batch_attachment(batch, 'source', device), model.batch_attachment(batch, 'target', device)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp and device.type == 'cuda'):
-                _, values = model(source, target, action, reverse)
-                queries['model'].append(model.projector(model.predict_latent(source, action)).float())
-                queries['zero_motion'].append(model.projector(model.predict_latent(source, torch.zeros_like(action))).float())
+                _, values = model(source, target, action, reverse, here, there)
+                queries['model'].append(model.projector(model.predict_latent(source, action, here)).float())
+                queries['zero_motion'].append(model.projector(model.predict_latent(source, torch.zeros_like(action), here)).float())
                 queries['copy_context'].append(model.target_projector(model.target_latent(source).mean(1)).float())
                 keys.append(model.target_projector(model.target_latent(target).mean(1)).float())
             for name, value in values.items():

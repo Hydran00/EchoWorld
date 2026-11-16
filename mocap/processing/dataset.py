@@ -6,6 +6,15 @@ Each sample is a triplet (I_a, I_b, a -> b motion) drawn from one recorded episo
     action           [6]                         inv(T_a) T_b: translation (mm), rotation vector (rad)
     reverse_action   [6]                         inv(T_b) T_a, used by the symmetric objective
 
+With anatomy=True (canonical caches after mocap.processing.canonical anatomy), also the anatomical
+attachment of both frames on the canonical body, used by the world model as the *current* position:
+
+    source_face, target_face                 []    int64 triangle of the canonical body
+    source_barycentric, target_barycentric   [3]   barycentric coordinates in that triangle
+
+The model reads only the attachment of the frame it predicts from (a for a -> b, b for the reverse
+direction), never the one of the predicted frame.
+
 Pairs never cross episode boundaries or tracking gaps, and the train/val/test split is made by
 episode before pairing (see assign_splits), so that no frame of a held-out episode is seen in training.
 """
@@ -61,7 +70,8 @@ def assign_splits(manifest, split_mode=LEGACY_SPLIT_MODE, split_fractions=(.7, .
 class MocapPairs(Dataset):
     def __init__(self, manifest, split='train', image_size=224, min_dt=.1, max_dt=3.,
                  min_mean=8., max_pairs_per_episode=0, seed=42, eval_dt=1., crop_scale=None,
-                 crop_mode='shared', split_mode=LEGACY_SPLIT_MODE, split_fractions=(.7, .15, .15), split_seed=42):
+                 crop_mode='shared', split_mode=LEGACY_SPLIT_MODE, split_fractions=(.7, .15, .15), split_seed=42,
+                 anatomy=False):
         self.manifest_path = Path(manifest).resolve()
         self.manifest = json.loads(self.manifest_path.read_text())
         if self.manifest['schema_version'] != 1:
@@ -82,6 +92,7 @@ class MocapPairs(Dataset):
         if self.crop_scale and not 0 < self.crop_scale[0] <= self.crop_scale[1] <= 1:
             raise ValueError('crop_scale must satisfy 0 < min <= max <= 1')
         self.episodes, self.items, self._images = [], [], {}
+        self.anatomy = bool(anatomy)
         self.split_mode = split_mode
         splits = assign_splits(self.manifest, split_mode, split_fractions, split_seed)
         for entry in self.manifest['episodes']:
@@ -90,6 +101,10 @@ class MocapPairs(Dataset):
             folder = self.manifest_path.parent / entry['path']
             with np.load(folder / 'poses.npz', allow_pickle=False) as f:
                 poses, times, segments = f['world_T_probe'], f['timestamps_ns'], f['segment_ids']
+                if self.anatomy:
+                    if 'canonical_face' not in f:
+                        raise ValueError(f'No anatomical attachment in {folder}: run mocap.processing.canonical anatomy')
+                    faces, barycentric = f['canonical_face'], f['canonical_barycentric']
             images = np.load(folder / 'images.npy', mmap_mode='r', allow_pickle=False)
             if len(images) != len(times) or len(poses) != len(times) or np.any(np.diff(times) <= 0):
                 raise ValueError(f'Corrupt cache: {entry["episode_id"]}')
@@ -99,6 +114,8 @@ class MocapPairs(Dataset):
             # heuristic on the cropped image, not an annotation of acoustic contact.
             valid = images.mean(axis=(1, 2)) >= min_mean
             episode = dict(entry, split=split, folder=folder, poses=poses, times=times, segments=segments)
+            if self.anatomy:
+                episode.update(faces=faces, barycentric=barycentric)
             ei = len(self.episodes)
             self.episodes.append(episode)
             # For each valid source frame i, the admissible targets are the valid frames between
@@ -132,6 +149,11 @@ class MocapPairs(Dataset):
         if tensor.shape[-1] != self.image_size:
             tensor = torch.nn.functional.interpolate(tensor[None], (self.image_size, self.image_size), mode='bilinear', align_corners=False)[0]
         return tensor
+
+    def attachment(self, episode, index):
+        """(face [] int64, barycentric [3] float32) of one frame on the canonical body."""
+        e = self.episodes[episode]
+        return torch.tensor(int(e['faces'][index])), torch.from_numpy(np.asarray(e['barycentric'][index], np.float32))
 
     def crop_box(self, generator):
         # RandomResizedCrop parameters with torchvision defaults (area fraction in crop_scale,
@@ -183,10 +205,14 @@ class MocapPairs(Dataset):
             box = self.crop_box(generator)
             target_box = self.crop_box(generator) if self.crop_mode == 'independent' else box
             source_image, target_image = self.crop(source_image, box), self.crop(target_image, target_box)
-        return dict(source=source_image, target=target_image,
+        item = dict(source=source_image, target=target_image,
                     action=torch.from_numpy(action),
                     reverse_action=torch.from_numpy(relative_action(poses[target], poses[source])), episode=ei, source_index=source, target_index=target,
                     dt_seconds=float((self.episodes[ei]['times'][target] - self.episodes[ei]['times'][source]) / 1e9))
+        if self.anatomy:
+            item['source_face'], item['source_barycentric'] = self.attachment(ei, source)
+            item['target_face'], item['target_barycentric'] = self.attachment(ei, target)
+        return item
 
     def __getstate__(self):
         state = self.__dict__.copy()
